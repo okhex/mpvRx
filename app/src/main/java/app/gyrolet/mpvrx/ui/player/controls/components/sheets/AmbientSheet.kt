@@ -51,6 +51,7 @@ import app.gyrolet.mpvrx.presentation.components.PlayerSheet
 import app.gyrolet.mpvrx.presentation.components.SliderItem
 import app.gyrolet.mpvrx.ui.icons.Icons
 import app.gyrolet.mpvrx.ui.player.AmbientShaderPresets
+import app.gyrolet.mpvrx.ui.player.AmbientStyle
 import app.gyrolet.mpvrx.ui.player.PlayerViewModel
 import app.gyrolet.mpvrx.ui.player.components.expressive.SectionHeader
 import app.gyrolet.mpvrx.ui.player.matchesGlowPreset
@@ -64,6 +65,7 @@ fun AmbientSheet(
   onDismissRequest: () -> Unit,
 ) {
   // ── Collect all state flows ──────────────────────────────────────────────
+  val ambientStyle by viewModel.ambientStyle.collectAsState()
   val blurSamples by viewModel.ambientBlurSamples.collectAsState()
   val maxRadius by viewModel.ambientMaxRadius.collectAsState()
   val glowIntensity by viewModel.ambientGlowIntensity.collectAsState()
@@ -123,6 +125,35 @@ fun AmbientSheet(
           Modifier
             .fillMaxWidth()
             .padding(bottom = 4.dp),
+      )
+
+      // ── Visual Style (Glow vs YouTube) ──────────────────────────────
+      Text(
+        text = stringResource(R.string.ambient_visual_style),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = MaterialTheme.spacing.medium),
+      )
+      Row(
+        modifier =
+          Modifier
+            .fillMaxWidth()
+            .padding(horizontal = MaterialTheme.spacing.medium),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        AmbientStyle.entries.forEach { style ->
+          ExpressivePresetButton(
+            label = stringResource(style.titleRes),
+            selected = ambientStyle == style,
+            onClick = { viewModel.setAmbientStyle(style) },
+          )
+        }
+      }
+
+      HorizontalDivider(
+        modifier = Modifier.padding(horizontal = MaterialTheme.spacing.medium),
+        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
       )
 
       // ── Quality Presets ──────────────────────────────────────────────

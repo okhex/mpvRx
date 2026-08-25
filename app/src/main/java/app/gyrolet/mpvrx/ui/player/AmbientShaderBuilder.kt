@@ -8,6 +8,8 @@ import android.content.Context
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -23,6 +25,7 @@ data class AmbientSharedShaderConfig(
 )
 
 data class AmbientGlowShaderSpec(
+  val style: AmbientStyle,
   val context: AmbientRenderContext,
   val shared: AmbientSharedShaderConfig,
   val blurSamples: Int,
@@ -83,49 +86,66 @@ private fun glslFloat(value: Double): String {
   return if (formatted.contains('.')) formatted else "$formatted.0"
 }
 
+private fun spiralRadiusNorm(
+  index: Int,
+  count: Int,
+): Double = sqrt((index.toDouble() + 0.5) / count.toDouble())
+
 private fun buildSpiralTapTable(
   name: String,
   samples: Int,
-  thirdComponent: (radiusNorm: Double, indexNorm: Double) -> Double,
+  thirdComponents: DoubleArray,
 ): String {
   val count = samples.coerceAtLeast(1)
   val taps =
     (0 until count).joinToString(",\n") { index ->
-      val indexNorm = (index.toDouble() + 0.5) / count.toDouble()
-      val radiusNorm = sqrt(indexNorm)
+      val radiusNorm = spiralRadiusNorm(index, count)
       val theta = (index.toDouble() + 0.5) * GOLDEN_ANGLE
       val x = cos(theta) * radiusNorm
       val y = sin(theta) * radiusNorm
-      "    vec3(${glslFloat(x)}, ${glslFloat(y)}, ${glslFloat(thirdComponent(radiusNorm, indexNorm))})"
+      "    vec3(${glslFloat(x)}, ${glslFloat(y)}, ${glslFloat(thirdComponents[index])})"
     }
   return "const vec3 $name[$count] = vec3[$count](\n$taps\n);"
 }
 
-object AmbientShaderBuilder {
-  fun build(
-    @Suppress("UNUSED_PARAMETER") context: Context,
-    spec: AmbientGlowShaderSpec,
-  ): String =
-    """
-//!HOOK OUTPUT
-//!BIND HOOKED
-//!DESC True Ambient Mode
+/**
+ * Glow distance falloff, precomputed per tap on the CPU. This used to be a
+ * `pow()` evaluated per tap per ambient pixel on the GPU; the inputs (tap
+ * radius, max radius, fade curve) are all compile-time constants of the
+ * shader, so baking it into the tap table removes BLUR_SAMPLES transcendental
+ * ops per pixel — a real win on mobile GPUs.
+ */
+private fun glowTapWeights(spec: AmbientGlowShaderSpec): DoubleArray {
+  val count = spec.blurSamples.coerceAtLeast(1)
+  val maxRadius = spec.maxRadius.toDouble()
+  val fadeCurve = spec.fadeCurve.toDouble()
+  return DoubleArray(count) { index ->
+    val r = spiralRadiusNorm(index, count) * maxRadius
+    (1.0 / (1.0 + r * 40.0)).pow(fadeCurve)
+  }
+}
 
-#define BLUR_SAMPLES     ${spec.blurSamples}
-#define MAX_RADIUS       ${spec.maxRadius}
-#define GLOW_INTENSITY   ${spec.glowIntensity}
-#define SAT_BOOST        ${spec.satBoost}
-#define BEZEL_DEPTH      ${spec.shared.bezelDepth}
-#define VIGNETTE_STR     ${spec.shared.vignetteStrength}
-#define WARMTH           ${spec.warmth}
-#define FADE_CURVE       ${spec.fadeCurve}
-#define OPACITY          ${spec.shared.opacity}
-#define SCALE_X          ${spec.context.scaleX}
-#define SCALE_Y          ${spec.context.scaleY}
+/**
+ * Gaussian blur weights for the YouTube-style projection, pre-normalized to
+ * sum to 1 so the GPU loop needs neither a weight accumulator nor a divide.
+ * Normalization is exact under the per-pixel jitter rotation because rotation
+ * preserves each tap's radius.
+ */
+private fun projectionTapWeights(samples: Int): DoubleArray {
+  val count = samples.coerceAtLeast(1)
+  val weights =
+    DoubleArray(count) { index ->
+      val radiusNorm = spiralRadiusNorm(index, count)
+      exp(-2.0 * radiusNorm * radiusNorm)
+    }
+  val sum = weights.sum()
+  for (i in weights.indices) weights[i] /= sum
+  return weights
+}
 
-const float PI = 3.14159265358979;
-${buildSpiralTapTable("GLOW_TAPS", spec.blurSamples) { radiusNorm, _ -> radiusNorm }}
-
+/** Helper functions shared by both ambient shader styles. */
+private val GLSL_COMMON_HELPERS =
+  """
 float rand(vec2 seed) {
     return fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
 }
@@ -144,8 +164,15 @@ vec3 apply_warmth(vec3 rgb, float amount) {
     rgb.b = clamp(rgb.b - amount * 0.080, 0.0, 1.0);
     return rgb;
 }
+  """.trimIndent()
 
-vec4 hook() {
+/**
+ * Start of hook(): remaps screen UV back to video UV and returns the untouched
+ * video pixel for everything inside the video rect. Only ambient-area pixels
+ * run the per-style blur below this block.
+ */
+private val GLSL_VIDEO_PROLOGUE =
+  """
     vec2 uv = HOOKED_pos;
     vec2 video_uv = (uv - 0.5) * vec2(SCALE_X, SCALE_Y) + 0.5;
 
@@ -163,45 +190,20 @@ vec4 hook() {
 
     vec2 edge_origin = clamp(video_uv, safe_min, safe_max);
     float edge_dist = length(video_uv - clamp(video_uv, 0.0, 1.0));
-    float edge_fade = exp(-edge_dist * (3.0 / max(MAX_RADIUS, 0.001)));
 
     float jitter = rand(uv * HOOKED_size) * (PI * 2.0);
     float jitter_s = sin(jitter);
     float jitter_c = cos(jitter);
     vec2 aspect_fix = vec2(HOOKED_size.y / HOOKED_size.x, 1.0);
+  """.trimIndent().prependIndent("    ")
 
-    vec3 acc_color = vec3(0.0);
-    float acc_weight = 0.0;
-
-    for (int i = 0; i < BLUR_SAMPLES; i++) {
-        vec3 tap = GLOW_TAPS[i];
-        vec2 base_offset = tap.xy * MAX_RADIUS;
-        float r = tap.z * MAX_RADIUS;
-
-        vec2 offset = vec2(
-            base_offset.x * jitter_c - base_offset.y * jitter_s,
-            base_offset.x * jitter_s + base_offset.y * jitter_c
-        ) * aspect_fix;
-        vec2 sample_uv = clamp(edge_origin + offset, safe_min, safe_max);
-        vec3 sample_rgb = HOOKED_tex(sample_uv).rgb;
-
-        float dist_w = pow(max(1.0 / (1.0 + r * 40.0), 0.0), FADE_CURVE);
-        float luma_w = 1.0 + luma(sample_rgb) * 2.0;
-        float weight = dist_w * luma_w;
-
-        acc_color += sample_rgb * weight;
-        acc_weight += weight;
-    }
-
-    vec3 glow = (acc_color / max(acc_weight, 1e-5)) * GLOW_INTENSITY;
-    glow = adjust_saturation(glow, SAT_BOOST);
-    glow = apply_warmth(glow, WARMTH);
-    glow *= edge_fade;
-
+/** End of hook(): vignette, opacity, and the optional bezel blend. */
+private val GLSL_AMBIENT_EPILOGUE =
+  """
     float vig_r = length(uv - 0.5) * 2.0;
-    glow *= mix(1.0, smoothstep(1.3, 0.1, vig_r), VIGNETTE_STR);
+    ambient_rgb *= mix(1.0, smoothstep(1.3, 0.1, vig_r), VIGNETTE_STR);
 
-    vec4 ambient_out = vec4(glow * OPACITY, 1.0);
+    vec4 ambient_out = vec4(ambient_rgb * OPACITY, 1.0);
 
     // A zero bezel means a hard, gap-free handoff from video to ambience.
     // The old max(BEZEL_DEPTH, 0.001) fallback forced a tiny transition even
@@ -216,6 +218,136 @@ vec4 hook() {
 
     vec4 edge_pixel = HOOKED_tex(edge_origin);
     return mix(edge_pixel, ambient_out, bezel_alpha);
+  """.trimIndent().prependIndent("    ")
+
+object AmbientShaderBuilder {
+  fun build(
+    @Suppress("UNUSED_PARAMETER") context: Context,
+    spec: AmbientGlowShaderSpec,
+  ): String =
+    when (spec.style) {
+      AmbientStyle.Glow -> buildGlow(spec)
+      AmbientStyle.YouTube -> buildYouTube(spec)
+    }
+
+  /**
+   * Glow: samples clamped to the nearest video edge, so colors bleed outward
+   * from the border with a luma-weighted falloff — a light spill look.
+   */
+  private fun buildGlow(spec: AmbientGlowShaderSpec): String =
+    """
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!DESC True Ambient Mode (Glow)
+
+#define BLUR_SAMPLES     ${spec.blurSamples}
+#define MAX_RADIUS       ${spec.maxRadius}
+#define GLOW_INTENSITY   ${spec.glowIntensity}
+#define SAT_BOOST        ${spec.satBoost}
+#define BEZEL_DEPTH      ${spec.shared.bezelDepth}
+#define VIGNETTE_STR     ${spec.shared.vignetteStrength}
+#define WARMTH           ${spec.warmth}
+#define OPACITY          ${spec.shared.opacity}
+#define SCALE_X          ${spec.context.scaleX}
+#define SCALE_Y          ${spec.context.scaleY}
+
+const float PI = 3.14159265358979;
+// tap.xy = unit-disc offset; tap.z = precomputed distance falloff (fade curve baked in).
+${buildSpiralTapTable("GLOW_TAPS", spec.blurSamples, glowTapWeights(spec))}
+
+$GLSL_COMMON_HELPERS
+
+vec4 hook() {
+$GLSL_VIDEO_PROLOGUE
+
+    float edge_fade = exp(-edge_dist * (3.0 / max(MAX_RADIUS, 0.001)));
+
+    vec3 acc_color = vec3(0.0);
+    float acc_weight = 0.0;
+
+    for (int i = 0; i < BLUR_SAMPLES; i++) {
+        vec3 tap = GLOW_TAPS[i];
+        vec2 base_offset = tap.xy * MAX_RADIUS;
+
+        vec2 offset = vec2(
+            base_offset.x * jitter_c - base_offset.y * jitter_s,
+            base_offset.x * jitter_s + base_offset.y * jitter_c
+        ) * aspect_fix;
+        vec3 sample_rgb = HOOKED_tex(clamp(edge_origin + offset, safe_min, safe_max)).rgb;
+
+        float weight = tap.z * (1.0 + luma(sample_rgb) * 2.0);
+
+        acc_color += sample_rgb * weight;
+        acc_weight += weight;
+    }
+
+    vec3 ambient_rgb = (acc_color / max(acc_weight, 1e-5)) * GLOW_INTENSITY;
+    ambient_rgb = adjust_saturation(ambient_rgb, SAT_BOOST);
+    ambient_rgb = apply_warmth(ambient_rgb, WARMTH);
+    ambient_rgb *= edge_fade;
+
+$GLSL_AMBIENT_EPILOGUE
+}
+    """.trimIndent()
+
+  /**
+   * YouTube: the ambient area shows a soft blurred projection of the whole
+   * frame. The video is already stretched to fill the screen, so screen-space
+   * UV addresses the projected image directly; a wide jittered disc blur with
+   * pre-normalized gaussian weights turns it into diffuse light — the same
+   * look as YouTube's Ambient Mode, computed entirely in mpv's GPU pass.
+   */
+  private fun buildYouTube(spec: AmbientGlowShaderSpec): String =
+    """
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!DESC YouTube Ambient Mode
+
+#define BLUR_SAMPLES     ${spec.blurSamples}
+#define MAX_RADIUS       ${spec.maxRadius}
+#define GLOW_INTENSITY   ${spec.glowIntensity}
+#define SAT_BOOST        ${spec.satBoost}
+#define BEZEL_DEPTH      ${spec.shared.bezelDepth}
+#define VIGNETTE_STR     ${spec.shared.vignetteStrength}
+#define WARMTH           ${spec.warmth}
+#define FADE_CURVE       ${spec.fadeCurve}
+#define OPACITY          ${spec.shared.opacity}
+#define SCALE_X          ${spec.context.scaleX}
+#define SCALE_Y          ${spec.context.scaleY}
+
+const float PI = 3.14159265358979;
+// tap.xy = unit-disc offset; tap.z = gaussian weight, pre-normalized to sum to 1.
+${buildSpiralTapTable("HALO_TAPS", spec.blurSamples, projectionTapWeights(spec.blurSamples))}
+
+$GLSL_COMMON_HELPERS
+
+vec4 hook() {
+$GLSL_VIDEO_PROLOGUE
+
+    // Gentle luminance falloff away from the video seam; FADE_CURVE 0.5..3.0
+    // maps from a near-uniform YouTube-like wash to a tight halo.
+    float edge_fade = exp(-edge_dist * FADE_CURVE * 2.0);
+
+    vec3 acc_color = vec3(0.0);
+
+    for (int i = 0; i < BLUR_SAMPLES; i++) {
+        vec3 tap = HALO_TAPS[i];
+        vec2 base_offset = tap.xy * MAX_RADIUS;
+
+        vec2 offset = vec2(
+            base_offset.x * jitter_c - base_offset.y * jitter_s,
+            base_offset.x * jitter_s + base_offset.y * jitter_c
+        ) * aspect_fix;
+
+        acc_color += HOOKED_tex(clamp(uv + offset, safe_min, safe_max)).rgb * tap.z;
+    }
+
+    vec3 ambient_rgb = acc_color * GLOW_INTENSITY;
+    ambient_rgb = adjust_saturation(ambient_rgb, SAT_BOOST);
+    ambient_rgb = apply_warmth(ambient_rgb, WARMTH);
+    ambient_rgb *= edge_fade;
+
+$GLSL_AMBIENT_EPILOGUE
 }
     """.trimIndent()
 }

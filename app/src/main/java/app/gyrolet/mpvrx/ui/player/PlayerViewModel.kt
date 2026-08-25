@@ -1464,6 +1464,9 @@ class PlayerViewModel : ViewModel(),
   private val _isAmbientEnabled = MutableStateFlow(playerPreferences.isAmbientEnabled.get())
   val isAmbientEnabled: StateFlow<Boolean> = _isAmbientEnabled.asStateFlow()
 
+  private val _ambientStyle = MutableStateFlow(playerPreferences.ambientStyle.get())
+  val ambientStyle: StateFlow<AmbientStyle> = _ambientStyle.asStateFlow()
+
   private val _ambientBlurSamples = MutableStateFlow(playerPreferences.ambientBlurSamples.get())
   val ambientBlurSamples: StateFlow<Int> = _ambientBlurSamples.asStateFlow()
 
@@ -5834,6 +5837,20 @@ class PlayerViewModel : ViewModel(),
     }
   }
 
+  /** Switches between the Glow and YouTube ambient styles; recompiles the shader if active. */
+  fun setAmbientStyle(style: AmbientStyle) {
+    if (MpvConfigOverridePolicy.ownsAny(MpvConfigControlledFeatures.AMBIENT)) return
+    if (_ambientStyle.value == style) return
+    _ambientStyle.value = style
+    playerPreferences.ambientStyle.set(style)
+    playerUpdate.value =
+      PlayerUpdates.ShowText(
+        appContext.getString(R.string.ambient_style_update, appContext.getString(style.titleRes)),
+      )
+    // The style is part of the compiled spec, so the cache invalidates naturally.
+    scheduleAmbientUpdate(0)
+  }
+
   /** Disables the ambient shader and resets video scale. Safe to call from any state. */
   private fun disableAmbientShader() {
     synchronized(ambientScheduleLock) {
@@ -6076,6 +6093,7 @@ class PlayerViewModel : ViewModel(),
       // ── Snapshot current parameter values ─────────────────────────────────
       val sx = scaleX
       val sy = scaleY
+      val style = _ambientStyle.value
       // Thermal-aware sample budget: cap shader complexity before the device enters
       // hard CPU/GPU throttling.  On a cool device this is a no-op.
       val rawSamples = _ambientBlurSamples.value
@@ -6091,6 +6109,7 @@ class PlayerViewModel : ViewModel(),
       // ── Generate GLSL shader ───────────────────────────────────────────────
       val spec =
         buildAmbientSpec(
+          style = style,
           sx = sx,
           sy = sy,
           blurSamples = samples,
@@ -6169,6 +6188,7 @@ class PlayerViewModel : ViewModel(),
    * spec has actually changed from the last compiled version.
    */
   private fun buildAmbientSpec(
+    style: AmbientStyle,
     sx: Double,
     sy: Double,
     blurSamples: Int,
@@ -6189,6 +6209,7 @@ class PlayerViewModel : ViewModel(),
       )
 
     return AmbientGlowShaderSpec(
+      style = style,
       context = context,
       shared = shared,
       blurSamples = blurSamples,
